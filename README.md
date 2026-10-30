@@ -48,7 +48,7 @@ ASR 同理，支持本地 mlx-whisper 或云端 API。
 ## 快速开始
 
 ```bash
-git clone <this-repo> ~/hermes-voice
+git clone https://github.com/<你的用户名>/hermes-voice-dual-track ~/hermes-voice
 cd ~/hermes-voice
 ./scripts/install.sh
 ```
