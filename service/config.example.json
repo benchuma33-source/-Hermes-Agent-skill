@@ -1,0 +1,53 @@
+{
+  "_readme": [
+    "复制成 config.json 后按需修改。",
+    "key 一律写 ${ENV_VAR}，真实值放环境变量或 ~/.hermes/.env，不要提交到 git。",
+    "tts.mode 和 asr.mode 可以自由组合：本地合成 + 云端识别是常见搭配。"
+  ],
+
+  "tts": {
+    "mode": "local",
+
+    "local": {
+      "model": "4bit",
+      "_model_options": "4bit(3GB, 快) | 8bit(4.6GB) | full(7.6GB, 质量理论最好但慢2-4倍)",
+      "voice_instruction": "高冷御姐音：成熟女性的清冷声线，音色醇厚有质感，语调从容、略带距离感，语速平缓沉稳。",
+      "seed": 77,
+      "temperature": 0.2,
+      "max_chars": 60,
+      "max_utterance_sec": 30,
+      "port": 8766
+    },
+
+    "api": {
+      "provider": "openai",
+      "_provider_options": "openai | dashscope",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "${OPENAI_API_KEY}",
+      "model": "gpt-4o-mini-tts",
+      "voice": "alloy",
+      "format": "mp3",
+      "speed": 1.0
+    }
+  },
+
+  "asr": {
+    "mode": "api",
+
+    "local": {
+      "engine": "mlx-whisper",
+      "_engine_options": "mlx-whisper(Apple Silicon) | faster-whisper(跨平台)",
+      "model": "mlx-community/whisper-large-v3-turbo",
+      "size": "base",
+      "language": null
+    },
+
+    "api": {
+      "provider": "dashscope",
+      "_provider_options": "dashscope | openai",
+      "base_url": "https://dashscope.aliyuncs.com",
+      "api_key": "${DASHSCOPE_API_KEY}",
+      "model": "qwen3-asr-flash"
+    }
+  }
+}

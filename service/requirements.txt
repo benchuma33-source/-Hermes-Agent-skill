@@ -1,0 +1,14 @@
+# 核心依赖（API 模式必需）
+fastapi>=0.115
+uvicorn>=0.30
+pydantic>=2.0
+soundfile>=0.12
+numpy>=1.24
+
+# 本地 TTS（Apple Silicon，Linux/Intel 请用 API 模式）
+mlx-audio>=0.1.0 ; platform_system == "Darwin" and platform_machine == "arm64"
+mlx>=0.20 ; platform_system == "Darwin" and platform_machine == "arm64"
+
+# 本地 ASR（可选，用 API 模式可以不装）
+# mlx-whisper>=0.4 ; platform_system == "Darwin" and platform_machine == "arm64"
+# faster-whisper>=1.0

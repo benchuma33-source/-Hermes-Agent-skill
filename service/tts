@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""
+tts —— TTS 统一入口，Hermes 的 command provider 调这个。
+
+    tts <input_path> <output_path>
+
+按 config.json 里的 tts.mode 自动分流：
+
+    local  → 本机常驻服务（Breeze TTS 2 / MLX），连不上会自动拉起
+    api    → 直接调云端（OpenAI 兼容 或 DashScope）
+
+输出格式按 output_path 的后缀决定（mp3 / wav / ogg / opus），
+需要时用 ffmpeg 转码。
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONFIG_PATH = Path(os.environ.get("VOICE_CONFIG", HERE / "config.json"))
+SERVER = HERE / "server.py"
+
+
+# ---------------------------------------------------------------------------
+# 配置
+# ---------------------------------------------------------------------------
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        example = HERE / "config.example.json"
+        raise SystemExit(
+            f"找不到配置 {CONFIG_PATH}\n"
+            f"先复制一份：cp {example} {CONFIG_PATH}"
+        )
+    raw = CONFIG_PATH.read_text(encoding="utf-8")
+    # 展开 ${VAR}
+    for line in raw.splitlines():
+        pass
+    cfg = json.loads(raw)
+    return _expand_env(cfg)
+
+
+def _expand_env(obj):
+    """把字符串里的 ${VAR} 换成环境变量 / ~/.hermes/.env 里的值。"""
+    if isinstance(obj, dict):
+        return {k: _expand_env(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env(v) for v in obj]
+    if isinstance(obj, str) and "${" in obj:
+        import re
+
+        def repl(m):
+            name = m.group(1)
+            val = os.environ.get(name)
+            if val:
+                return val
+            env_file = Path.home() / ".hermes" / ".env"
+            if env_file.exists():
+                for ln in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                    ln = ln.strip()
+                    if ln.startswith(f"{name}="):
+                        return ln.split("=", 1)[1].strip().strip('"').strip("'")
+            return ""
+
+        return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", repl, obj)
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# local 模式：常驻服务
+# ---------------------------------------------------------------------------
+def _service_url(cfg: dict) -> str:
+    port = (cfg.get("tts", {}).get("local", {}) or {}).get("port", 8766)
+    return f"http://127.0.0.1:{port}"
+
+
+def _healthy(url: str, wait: float = 0.0) -> bool:
+    deadline = time.time() + wait
+    while True:
+        try:
+            with urllib.request.urlopen(url + "/health", timeout=2) as r:
+                return json.loads(r.read()).get("ready", False)
+        except Exception:
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.5)
+
+
+def _start_service(cfg: dict) -> None:
+    py = os.environ.get("VOICE_PYTHON") or str(HERE.parent / ".venv" / "bin" / "python")
+    if not Path(py).exists():
+        py = sys.executable
+    log = HERE / "service.log"
+    subprocess.Popen(
+        [py, str(SERVER), "--config", str(CONFIG_PATH)],
+        stdout=open(log, "ab"),
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+
+def synth_local(text: str, cfg: dict) -> bytes:
+    url = _service_url(cfg)
+    if not _healthy(url):
+        print("本地服务未就绪，尝试启动…", file=sys.stderr)
+        _start_service(cfg)
+        if not _healthy(url, wait=120):
+            raise RuntimeError(
+                f"连不上本地 TTS 服务 {url}\n"
+                f"手动启动：{sys.executable} {SERVER} --config {CONFIG_PATH}"
+            )
+    payload = json.dumps({"text": text}).encode()
+    req = urllib.request.Request(
+        url + "/tts", data=payload, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return r.read()
+
+
+# ---------------------------------------------------------------------------
+# api 模式
+# ---------------------------------------------------------------------------
+def _key(cfg: dict) -> str:
+    k = (cfg.get("tts", {}).get("api", {}) or {}).get("api_key", "")
+    if not k:
+        raise RuntimeError(
+            "tts.api.api_key 为空。在 config.json 里写 ${YOUR_ENV_VAR}，"
+            "然后把变量放进 ~/.hermes/.env"
+        )
+    return k
+
+
+def synth_api_openai(text: str, cfg: dict) -> bytes:
+    """OpenAI 标准的 /audio/speech。任何兼容实现都能用。"""
+    api = cfg["tts"]["api"]
+    base = api.get("base_url", "https://api.openai.com/v1").rstrip("/")
+    fmt = api.get("format", "mp3")
+    payload = {
+        "model": api.get("model", "gpt-4o-mini-tts"),
+        "input": text,
+        "voice": api.get("voice", "alloy"),
+        "response_format": fmt,
+    }
+    if api.get("speed"):
+        payload["speed"] = api["speed"]
+    if api.get("instructions"):
+        payload["instructions"] = api["instructions"]
+
+    req = urllib.request.Request(
+        f"{base}/audio/speech",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {_key(cfg)}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=300) as r:
+        return r.read()
+
+
+def synth_api_dashscope(text: str, cfg: dict) -> bytes:
+    """DashScope 原生 TTS（qwen3-tts-flash）。
+
+    注意：OpenAI 兼容路径 /compatible-mode/v1/audio/speech 是 404，
+    必须走原生 multimodal-generation。返回里给的是音频 URL，要再下一次。
+    """
+    api = cfg["tts"]["api"]
+    base = api.get("base_url", "https://dashscope.aliyuncs.com").rstrip("/")
+    payload = {
+        "model": api.get("model", "qwen3-tts-flash"),
+        "input": {"text": text, "voice": api.get("voice", "Cherry")},
+    }
+    req = urllib.request.Request(
+        f"{base}/api/v1/services/aigc/multimodal-generation/generation",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {_key(cfg)}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=300) as r:
+        data = json.loads(r.read())
+
+    if data.get("code"):
+        raise RuntimeError(f"DashScope 报错 {data['code']}: {data.get('message', '')[:200]}")
+
+    audio_url = _find_audio_url(data)
+    if not audio_url:
+        raise RuntimeError(f"返回里找不到音频 URL: {json.dumps(data, ensure_ascii=False)[:300]}")
+
+    with urllib.request.urlopen(audio_url, timeout=300) as r:
+        return r.read()
+
+
+def _find_audio_url(obj) -> str | None:
+    """递归找返回体里的音频 URL（各家字段名不一致）。"""
+    if isinstance(obj, str):
+        if obj.startswith("http") and any(
+            obj.lower().split("?")[0].endswith(e) for e in (".wav", ".mp3", ".ogg", ".m4a")
+        ):
+            return obj
+        return None
+    if isinstance(obj, dict):
+        for k in ("audio", "url", "audio_url", "audioUrl", "data"):
+            if k in obj:
+                found = _find_audio_url(obj[k])
+                if found:
+                    return found
+        for v in obj.values():
+            found = _find_audio_url(v)
+            if found:
+                return found
+    if isinstance(obj, list):
+        for v in obj:
+            found = _find_audio_url(v)
+            if found:
+                return found
+    return None
+
+
+def synth_api(text: str, cfg: dict) -> bytes:
+    provider = (cfg.get("tts", {}).get("api", {}) or {}).get("provider", "openai")
+    if provider == "dashscope":
+        return synth_api_dashscope(text, cfg)
+    return synth_api_openai(text, cfg)
+
+
+# ---------------------------------------------------------------------------
+# 输出
+# ---------------------------------------------------------------------------
+def write_output(audio: bytes, output_path: str, want_fmt: str | None = None) -> None:
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # 探测音频真实格式（不靠后缀猜）
+    actual = _sniff(audio)
+    want = (want_fmt or out.suffix.lstrip(".") or "mp3").lower()
+
+    if actual == want or (actual == "wav" and want == "wav"):
+        out.write_bytes(audio)
+        return
+
+    ffmpeg = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+    if not Path(ffmpeg).exists():
+        # 没 ffmpeg 就只能原样写，但改成正确的后缀以免播放器打不开
+        fallback = out.with_suffix("." + actual)
+        fallback.write_bytes(audio)
+        print(f"警告：未找到 ffmpeg，无法转 {want}，已输出 {fallback}", file=sys.stderr)
+        return
+
+    with tempfile.NamedTemporaryFile(suffix="." + actual, delete=False) as tmp:
+        tmp.write(audio)
+        tmp_path = tmp.name
+    try:
+        cmd = [ffmpeg, "-y", "-loglevel", "error", "-i", tmp_path]
+        if want in ("ogg", "opus"):
+            cmd += ["-c:a", "libopus", "-b:a", "48k"]
+        elif want == "mp3":
+            cmd += ["-c:a", "libmp3lame", "-b:a", "128k", "-ar", "44100"]
+        cmd += [str(out)]
+        r = subprocess.run(cmd, capture_output=True, timeout=180)
+        if r.returncode != 0:
+            print(f"转码失败：{r.stderr.decode('utf-8', 'replace')[:200]}", file=sys.stderr)
+            out.with_suffix("." + actual).write_bytes(audio)
+            sys.exit(1)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def _sniff(b: bytes) -> str:
+    """看魔术字节判断真实格式。"""
+    if b[:4] == b"RIFF" and b[8:12] == b"WAVE":
+        return "wav"
+    if b[:4] == b"OggS":
+        return "ogg"
+    if b[:4] == b"fLaC":
+        return "flac"
+    if b[4:8] == b"ftyp":
+        return "m4a"
+    if b[:3] == b"ID3" or b[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "mp3"
+    return "mp3"
+
+
+# ---------------------------------------------------------------------------
+def main() -> int:
+    if len(sys.argv) < 3:
+        print("用法: tts <input_path> <output_path>", file=sys.stderr)
+        return 2
+
+    input_path, output_path = sys.argv[1], sys.argv[2]
+
+    try:
+        text = Path(input_path).read_text(encoding="utf-8", errors="replace").strip()
+    except Exception as e:
+        print(f"读取输入失败：{e}", file=sys.stderr)
+        return 1
+    if not text:
+        print("输入文本为空", file=sys.stderr)
+        return 1
+
+    try:
+        cfg = load_config()
+        mode = (cfg.get("tts", {}) or {}).get("mode", "local")
+        audio = synth_local(text, cfg) if mode == "local" else synth_api(text, cfg)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:300]
+        print(f"合成失败 HTTP {e.code}: {body}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"合成失败：{e}", file=sys.stderr)
+        return 1
+
+    write_output(audio, output_path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

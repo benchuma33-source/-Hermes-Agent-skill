@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""
+asr —— ASR 统一入口，Hermes 的 command provider 调这个。
+
+    asr <audio_path>
+
+识别结果打到 stdout（Hermes 会读走当转录文本）。
+
+按 config.json 里的 asr.mode 分流：
+
+    local  → mlx-whisper（Apple Silicon）或 faster-whisper
+    api    → DashScope / OpenAI / 任意 OpenAI 兼容
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONFIG_PATH = Path(os.environ.get("VOICE_CONFIG", HERE / "config.json"))
+MAX_BYTES = 10 * 1024 * 1024
+
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        raise SystemExit(f"找不到配置 {CONFIG_PATH}")
+    return _expand_env(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+
+
+def _expand_env(obj):
+    if isinstance(obj, dict):
+        return {k: _expand_env(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env(v) for v in obj]
+    if isinstance(obj, str) and "${" in obj:
+        def repl(m):
+            name = m.group(1)
+            val = os.environ.get(name)
+            if val:
+                return val
+            env_file = Path.home() / ".hermes" / ".env"
+            if env_file.exists():
+                for ln in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                    ln = ln.strip()
+                    if ln.startswith(f"{name}="):
+                        return ln.split("=", 1)[1].strip().strip('"').strip("'")
+            return ""
+        return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", repl, obj)
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# 音频预处理
+# ---------------------------------------------------------------------------
+def to_wav16k(src: Path) -> Path | None:
+    """统一转 16 kHz 单声道 WAV。各家对容器/采样率都挑剔，转一下最省事。"""
+    out = Path(tempfile.gettempdir()) / f"asr_{os.getpid()}.wav"
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+             "-ac", "1", "-ar", "16000", str(out)],
+            capture_output=True, timeout=180,
+        )
+        if r.returncode == 0 and out.exists() and out.stat().st_size > 1000:
+            return out
+    except Exception:
+        pass
+    return None
+
+
+def _curl_json(url: str, payload_file: str, key: str, timeout: int = 180) -> dict:
+    """用 curl 发 JSON。
+
+    为什么不用 urllib：某些 Python 环境的 CA 包不全，会报
+    CERTIFICATE_VERIFY_FAILED，而 curl 走系统证书链是正常的。
+    """
+    r = subprocess.run(
+        ["curl", "-s", "--max-time", str(timeout), "-X", "POST", url,
+         "-H", f"Authorization: Bearer {key}",
+         "-H", "Content-Type: application/json",
+         "--data-binary", f"@{payload_file}"],
+        capture_output=True, text=True, timeout=timeout + 30,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"curl 失败（{r.returncode}）：{r.stderr.strip()[:200]}")
+    raw = (r.stdout or "").strip()
+    if not raw:
+        raise RuntimeError(f"空响应：{r.stderr.strip()[:200]}")
+    return json.loads(raw)
+
+
+# ---------------------------------------------------------------------------
+# local 模式
+# ---------------------------------------------------------------------------
+def asr_local(audio: Path, cfg: dict) -> str:
+    c = cfg.get("asr", {}).get("local", {}) or {}
+    engine = c.get("engine", "mlx-whisper")
+    model = c.get("model", "mlx-community/whisper-large-v3-turbo")
+    language = c.get("language") or None
+
+    wav = to_wav16k(audio) or audio
+    try:
+        if engine == "mlx-whisper":
+            import mlx_whisper  # type: ignore
+
+            result = mlx_whisper.transcribe(
+                str(wav), path_or_hf_repo=model, language=language
+            )
+            return (result.get("text") or "").strip()
+
+        if engine == "faster-whisper":
+            from faster_whisper import WhisperModel  # type: ignore
+
+            m = WhisperModel(c.get("size", "base"), device="cpu", compute_type="int8")
+            segments, _ = m.transcribe(str(wav), language=language)
+            return "".join(seg.text for seg in segments).strip()
+
+        raise RuntimeError(f"未知的本地引擎：{engine}")
+    finally:
+        if wav != audio and wav.exists():
+            wav.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# api 模式
+# ---------------------------------------------------------------------------
+def asr_api_dashscope(audio: Path, cfg: dict) -> str:
+    """DashScope 原生 ASR（qwen3-asr-flash）。
+
+    试过的端点（别浪费时间重试）：
+      ✅ /api/v1/services/aigc/multimodal-generation/generation + data URL
+      ❌ /compatible-mode/v1/audio/transcriptions      → 404
+      ❌ chat/completions + input_audio                → 400 dedicated task 不支持
+      ❌ /api/v1/services/audio/asr/transcription      → 只收公网 URL
+    """
+    c = cfg["asr"]["api"]
+    base = c.get("base_url", "https://dashscope.aliyuncs.com").rstrip("/")
+    key = c.get("api_key", "")
+    if not key:
+        raise RuntimeError("asr.api.api_key 为空")
+
+    wav = to_wav16k(audio) or audio
+    try:
+        if wav.stat().st_size > MAX_BYTES:
+            raise RuntimeError(f"音频过大（{wav.stat().st_size/1e6:.1f}MB）")
+        b64 = base64.b64encode(wav.read_bytes()).decode()
+        payload = {
+            "model": c.get("model", "qwen3-asr-flash"),
+            "input": {"messages": [{"role": "user", "content": [
+                {"audio": f"data:audio/wav;base64,{b64}"}
+            ]}]},
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            req_file = f.name
+        try:
+            data = _curl_json(
+                f"{base}/api/v1/services/aigc/multimodal-generation/generation",
+                req_file, key,
+            )
+        finally:
+            Path(req_file).unlink(missing_ok=True)
+
+        if data.get("code"):
+            raise RuntimeError(f"{data['code']}: {data.get('message', '')[:200]}")
+
+        choices = (data.get("output") or {}).get("choices") or []
+        if not choices:
+            raise RuntimeError(f"返回里没有 choices：{json.dumps(data, ensure_ascii=False)[:300]}")
+        content = choices[0].get("message", {}).get("content") or []
+        if isinstance(content, str):
+            return content.strip()
+        return "".join(c.get("text", "") for c in content if isinstance(c, dict)).strip()
+    finally:
+        if wav != audio and wav.exists():
+            wav.unlink(missing_ok=True)
+
+
+def asr_api_openai(audio: Path, cfg: dict) -> str:
+    c = cfg["asr"]["api"]
+    base = c.get("base_url", "https://api.openai.com/v1").rstrip("/")
+    key = c.get("api_key", "")
+    if not key:
+        raise RuntimeError("asr.api.api_key 为空")
+
+    wav = to_wav16k(audio) or audio
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "--max-time", "300", "-X", "POST",
+             f"{base}/audio/transcriptions",
+             "-H", f"Authorization: Bearer {key}",
+             "-F", f"file=@{wav}",
+             "-F", f"model={c.get('model', 'whisper-1')}"],
+            capture_output=True, text=True, timeout=330,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"curl 失败：{r.stderr.strip()[:200]}")
+        raw = (r.stdout or "").strip()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw  # 有些实现直接返回纯文本
+        if data.get("error"):
+            raise RuntimeError(str(data["error"])[:200])
+        return (data.get("text") or "").strip()
+    finally:
+        if wav != audio and wav.exists():
+            wav.unlink(missing_ok=True)
+
+
+def asr_api(audio: Path, cfg: dict) -> str:
+    provider = (cfg.get("asr", {}).get("api", {}) or {}).get("provider", "openai")
+    if provider == "dashscope":
+        return asr_api_dashscope(audio, cfg)
+    return asr_api_openai(audio, cfg)
+
+
+# ---------------------------------------------------------------------------
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("用法: asr <audio_path>", file=sys.stderr)
+        return 2
+
+    audio = Path(sys.argv[1])
+    if not audio.exists():
+        print(f"音频不存在：{audio}", file=sys.stderr)
+        return 1
+
+    try:
+        cfg = load_config()
+        mode = (cfg.get("asr", {}) or {}).get("mode", "api")
+        text = asr_local(audio, cfg) if mode == "local" else asr_api(audio, cfg)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:300]
+        print(f"识别失败 HTTP {e.code}: {body}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"识别失败：{e}", file=sys.stderr)
+        return 1
+
+    if not text:
+        print("识别结果为空", file=sys.stderr)
+        return 1
+    print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
